@@ -2,13 +2,17 @@
 
 Wattline shows where your Mac’s power goes. Click its menu bar gauge to see current power draw and charging status. Open **Power details** to compare the power arriving from the charger with the power flowing into or out of the battery.
 
+![Wattline Network dashboard showing simulated download and upload activity](docs/wattline-preview.png)
+
 ## Build and run
 
 Wattline runs on macOS 14 or later on Apple silicon and Intel. To build from source, use a Mac with Xcode and its command-line tools selected. The package declares Swift tools version 5.10 and was tested with Xcode 26.5 (Swift 6.3.2). It uses Apple frameworks and has no third-party package dependencies.
 
-Build and launch Wattline from the root of your clone.
+Clone the project, build Wattline, and open the app.
 
 ```sh
+git clone https://github.com/Thorkee/Wattline.git
+cd Wattline
 ./build-app.sh
 open .build/Wattline.app
 ```

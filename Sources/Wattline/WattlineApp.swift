@@ -15,7 +15,7 @@ enum WattlineApp {
 }
 
 @MainActor
-private final class ShortcutPanel: NSPanel {
+private final class PowerDropdownPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override func cancelOperation(_ sender: Any?) { close() }
 }
@@ -121,17 +121,19 @@ private final class MainWindowController: NSWindowController, NSWindowDelegate {
 }
 
 @MainActor
-private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSWindowDelegate {
+private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let monitor = PowerMonitor()
     private let navigation = WattlineNavigation()
-    private let popover = NSPopover()
     private var item: NSStatusItem?
     private var observation: AnyCancellable?
     private var preferencesObservation: AnyCancellable?
     private var shortcut: PanelShortcut?
-    private var shortcutPanel: ShortcutPanel?
-    private var shortcutScreenID: NSNumber?
-    private var shortcutSizeObservation: NSKeyValueObservation?
+    private var dropdown: PowerDropdownPanel?
+    private var dropdownAnchor: WindowPlacement.Anchor = .topTrailing
+    private var sourceButtonFrame: CGRect?
+    private var outsideClickMonitors: [Any] = []
+    private var dropdownScreenID: NSNumber?
+    private var dropdownSizeObservation: NSKeyValueObservation?
     private var shortcutAvailability: AnyCancellable?
     private var mainWindowController: MainWindowController?
     private var currentAppearance: String?
@@ -203,12 +205,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
         shortcutAvailability = shortcut?.$isAvailable.removeDuplicates().sink { [weak self] available in
             self?.navigation.shortcutAvailable = available
         }
-        let controller = NSHostingController(rootView: makePanel())
-        controller.sizingOptions = [.preferredContentSize]
-        popover.contentViewController = controller
-        popover.contentSize = controller.view.fittingSize
-        popover.behavior = .transient
-        popover.delegate = self
         observation = monitor.$latest.sink { [weak self] reading in self?.updateButton(reading) }
         preferencesObservation = NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)
             .receive(on: RunLoop.main)
@@ -227,7 +223,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
     }
 
     @objc private func activeSpaceChanged() {
-        shortcutPanel?.close()
+        dropdown?.close()
     }
 
     private func applyAppearance() {
@@ -252,14 +248,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
     }
 
     @objc private func openMainWindow() {
-        let screen = shortcutPanel?.screen ?? (popover.isShown ? popover.contentViewController?.view.window?.screen : nil)
+        let screen = dropdown?.screen
         presentMainWindow(on: screen ?? mainWindowController?.window?.screen ?? pointerScreen)
     }
 
     private func presentMainWindow(on screen: NSScreen?) {
         guard let screen else { return }
-        if popover.isShown { popover.performClose(nil) }
-        shortcutPanel?.close()
+        dropdown?.close()
         if mainWindowController == nil {
             mainWindowController = MainWindowController(power: monitor, navigation: navigation, screen: screen)
         }
@@ -274,14 +269,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
 
     private var pointerScreen: NSScreen? {
         NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main
-    }
-
-    func popoverWillShow(_ notification: Notification) {
-        monitor.setPanelVisible(true)
-    }
-
-    func popoverDidClose(_ notification: Notification) {
-        if shortcutPanel == nil { monitor.setPanelVisible(false) }
     }
 
     private func updateButton(_ reading: PowerReading) {
@@ -301,34 +288,54 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
         button.setAccessibilityHelp("Show or hide quick power details.")
     }
 
+    // A status item can be mirrored in several menu bars while AppKit supplies
+    // just one button window. Resolve the physical click before opening a window.
     @objc private func statusItemPressed() {
-        if let shortcutPanel, shortcutPanel.isVisible { shortcutPanel.close(); return }
-        if popover.isShown { popover.performClose(nil); return }
-        showPanel()
-    }
+        guard let button = item?.button else { return }
+        let proxy = button.window?.convertToScreen(button.convert(button.bounds, to: nil))
+        let pointer = NSEvent.mouseLocation
+        let event = NSApp.currentEvent
+        let eventPoint: CGPoint?
+        switch event?.type {
+        case .leftMouseUp, .rightMouseUp: eventPoint = event?.cgEvent?.unflippedLocation
+        default: eventPoint = nil
+        }
 
-    private func showPanel() {
-        guard !popover.isShown, let button = item?.button else { return }
-        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-        popover.contentViewController?.view.window?.makeKey()
+        let proxyCenter = proxy.map { CGPoint(x: $0.midX, y: $0.midY) }
+        var location: (NSScreen, CGPoint)?
+        for point in [pointer, eventPoint, proxyCenter].compactMap({ $0 }) {
+            if let screen = NSScreen.screens.first(where: { screen in
+                let strip = max(screen.safeAreaInsets.top, NSStatusBar.system.thickness, button.bounds.height)
+                return screen.frame.contains(point) && point.y >= screen.frame.maxY - strip - 1
+            }) {
+                location = (screen, point)
+                break
+            }
+        }
+        guard let screen = location?.0 ?? pointerScreen else { return }
+        let point = location?.1 ?? CGPoint(x: screen.visibleFrame.maxX - button.bounds.width / 2, y: screen.frame.maxY)
+        let anchorX = proxy.flatMap { $0.contains(point) ? $0.midX : nil } ?? point.x
+        let strip = max(screen.safeAreaInsets.top, NSStatusBar.system.thickness, button.bounds.height)
+        let hitArea = CGRect(x: anchorX - button.bounds.width / 2, y: screen.frame.maxY - strip,
+                             width: button.bounds.width, height: strip)
+        if let panel = dropdown {
+            let sameDisplay = dropdownScreenID == screenID(screen)
+            panel.close()
+            if sameDisplay { return }
+        }
+        showDropdown(on: screen, anchor: .menuItem(x: anchorX), sourceFrame: hitArea)
     }
 
     private func toggleFromKeyboard() {
-        if let shortcutPanel, shortcutPanel.isVisible { shortcutPanel.close(); return }
-        if popover.isShown { popover.performClose(nil); return }
-        if let screen = pointerScreen { showShortcutPanel(on: screen) }
+        if let panel = dropdown { panel.close(); return }
+        if let screen = pointerScreen { showDropdown(on: screen, anchor: .topTrailing, sourceFrame: nil) }
     }
 
-    // This panel can open even when the system has crowded the status item offscreen.
-    private func showShortcutPanel(on screen: NSScreen) {
-        if let oldPanel = shortcutPanel {
-            if oldPanel.isVisible { return }
-            oldPanel.close()
-        }
+    private func showDropdown(on screen: NSScreen, anchor: WindowPlacement.Anchor, sourceFrame: CGRect?) {
         let controller = NSHostingController(rootView: makePanel().clipShape(RoundedRectangle(cornerRadius: 14)))
         let size = controller.view.fittingSize
         controller.sizingOptions = [.preferredContentSize]
-        let panel = ShortcutPanel(
+        let panel = PowerDropdownPanel(
             contentRect: NSRect(origin: .zero, size: size), styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered, defer: false
         )
@@ -341,42 +348,65 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .canJoinAllApplications, .transient, .ignoresCycle]
         panel.contentViewController = controller
         panel.delegate = self
-        shortcutPanel = panel
-        shortcutScreenID = screenID(screen)
-        placeShortcutPanel(panel, size: size, screen: screen)
-        shortcutSizeObservation = controller.observe(\.preferredContentSize, options: [.new]) { [weak self] _, _ in
-            DispatchQueue.main.async { self?.updateShortcutPlacement() }
+        dropdown = panel
+        dropdownAnchor = anchor
+        sourceButtonFrame = sourceFrame
+        panel.title = "Wattline power details"
+        panel.isExcludedFromWindowsMenu = true
+        dropdownScreenID = screenID(screen)
+        placeDropdown(panel, size: size, screen: screen)
+        dropdownSizeObservation = controller.observe(\.preferredContentSize, options: [.new]) { [weak self] _, _ in
+            DispatchQueue.main.async { self?.updateDropdownPlacement() }
         }
         panel.orderFrontRegardless()
         panel.makeKey()
+        item?.button?.highlight(sourceFrame != nil)
+        let mouseDown: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        if let token = NSEvent.addGlobalMonitorForEvents(matching: mouseDown, handler: { [weak self] _ in
+            self?.dismissIfOutside()
+        }) { outsideClickMonitors.append(token) }
+        if let token = NSEvent.addLocalMonitorForEvents(matching: mouseDown, handler: { [weak self] event in
+            self?.dismissIfOutside()
+            return event
+        }) { outsideClickMonitors.append(token) }
         monitor.setPanelVisible(true)
     }
 
-    private func placeShortcutPanel(_ panel: NSPanel, size: CGSize, screen: NSScreen) {
+    private func dismissIfOutside() {
+        let point = NSEvent.mouseLocation
+        if let panel = dropdown, !panel.frame.contains(point), sourceButtonFrame?.contains(point) != true {
+            panel.close()
+        }
+    }
+
+    private func placeDropdown(_ panel: NSPanel, size: CGSize, screen: NSScreen) {
         guard size.width > 0, size.height > 0 else { return }
         let frame = screen.frame
         let insets = screen.safeAreaInsets
         let safe = CGRect(x: frame.minX + insets.left, y: frame.minY + insets.bottom,
                           width: frame.width - insets.left - insets.right,
                           height: frame.height - insets.top - insets.bottom)
-        let area = screen.visibleFrame.intersection(safe)
+        var area = screen.visibleFrame.intersection(safe)
+        if case .menuItem = dropdownAnchor {
+            let barBottom = frame.maxY - max(insets.top, NSStatusBar.system.thickness, item?.button?.bounds.height ?? 0)
+            area.size.height = max(0, min(area.maxY, barBottom) - area.minY)
+        }
         guard !area.isEmpty else { return }
-        let target = WindowPlacement.frame(size: size, in: area, anchor: .topTrailing)
+        let target = WindowPlacement.frame(size: size, in: area, anchor: dropdownAnchor)
         if panel.frame != target { panel.setFrame(target, display: false) }
     }
 
-    private func updateShortcutPlacement() {
-        guard let panel = shortcutPanel, let controller = panel.contentViewController else { return }
+    private func updateDropdownPlacement() {
+        guard let panel = dropdown, let controller = panel.contentViewController else { return }
         let previous = NSScreen.screens.first {
-            screenID($0) == shortcutScreenID
+            screenID($0) == dropdownScreenID
         }
-        guard let screen = previous ?? pointerScreen else { panel.close(); return }
-        shortcutScreenID = screenID(screen)
-        placeShortcutPanel(panel, size: controller.view.fittingSize, screen: screen)
+        guard let screen = previous else { panel.close(); return }
+        placeDropdown(panel, size: controller.view.fittingSize, screen: screen)
     }
 
     func applicationDidChangeScreenParameters(_ notification: Notification) {
-        updateShortcutPlacement()
+        updateDropdownPlacement()
         if let controller = mainWindowController, controller.isOpen, let screen = controller.window?.screen ?? pointerScreen {
             controller.fit(on: screen)
         }
@@ -386,17 +416,22 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
     func applicationDidUnhide(_ notification: Notification) { mainWindowController?.updateVisibility() }
 
     func windowWillClose(_ notification: Notification) {
-        guard let window = notification.object as? NSWindow, window === shortcutPanel else { return }
-        shortcutSizeObservation = nil
-        shortcutScreenID = nil
-        shortcutPanel = nil
-        if !popover.isShown { monitor.setPanelVisible(false) }
+        guard let window = notification.object as? NSWindow, window === dropdown else { return }
+        outsideClickMonitors.forEach(NSEvent.removeMonitor)
+        outsideClickMonitors.removeAll()
+        sourceButtonFrame = nil
+        item?.button?.highlight(false)
+        dropdownSizeObservation = nil
+        dropdownScreenID = nil
+        dropdown = nil
+        monitor.setPanelVisible(false)
     }
 
     func windowDidResignKey(_ notification: Notification) {
-        guard let panel = notification.object as? ShortcutPanel else { return }
+        guard let panel = notification.object as? PowerDropdownPanel else { return }
         DispatchQueue.main.async { [weak self, weak panel] in
-            if let panel, self?.shortcutPanel === panel, !panel.isKeyWindow { panel.close() }
+            guard let self, let panel, self.dropdown === panel, !panel.isKeyWindow else { return }
+            if self.sourceButtonFrame?.contains(NSEvent.mouseLocation) != true { panel.close() }
         }
     }
 

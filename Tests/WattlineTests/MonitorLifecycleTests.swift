@@ -40,4 +40,24 @@ final class MonitorLifecycleTests: XCTestCase {
             }
         }
     }
+
+    func testMenuDropdownFollowsClickOnOffsetDisplays() {
+        let size = CGSize(width: 316, height: 258)
+        for area in [CGRect(x: -1920, y: -160, width: 1920, height: 1056),
+                     CGRect(x: 240, y: 982, width: 1440, height: 876)] {
+            let clickedX = area.minX + 492
+            let frame = WindowPlacement.frame(size: size, in: area, anchor: .menuItem(x: clickedX))
+            XCTAssertEqual(frame.midX, clickedX)
+            XCTAssertEqual(frame.maxY, area.maxY - 3)
+            XCTAssertEqual(frame.size, size)
+            XCTAssertEqual(WindowPlacement.frame(size: size, in: area, anchor: .menuItem(x: area.minX + 4)).minX, area.minX)
+            XCTAssertEqual(WindowPlacement.frame(size: size, in: area, anchor: .menuItem(x: area.maxX - 4)).maxX, area.maxX)
+        }
+    }
+
+    func testOversizeMenuDropdownFitsUsableDisplayArea() {
+        let area = CGRect(x: -290, y: 1200, width: 245, height: 180)
+        let panel = WindowPlacement.frame(size: CGSize(width: 316, height: 258), in: area, anchor: .menuItem(x: area.maxX - 2))
+        XCTAssertEqual(panel, area)
+    }
 }
