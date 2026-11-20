@@ -19,3 +19,5 @@ jobs:
         run: swift test
       - name: Build and verify universal app
         run: ./build-app.sh
+      - name: Package and verify installer
+        run: ./build-dmg.sh

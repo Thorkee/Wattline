@@ -51,6 +51,8 @@ for arch in "${architectures[@]}"; do
     slices+=("$stage/Wattline-$arch")
 done
 xcrun lipo -create "${slices[@]}" -output "$executable"
+# Remove the linker's debug map, which includes the builder's local source paths.
+xcrun strip -S "$executable"
 xcrun lipo "$executable" -verify_arch "${architectures[@]}"
 for arch in "${architectures[@]}"; do
     if ! xcrun vtool -arch "$arch" -show-build "$executable" |
